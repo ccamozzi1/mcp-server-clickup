@@ -1170,11 +1170,7 @@ class DeleteTaskInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     task_id: str = Field(..., description="ID da task a deletar", min_length=1)
 
-class MoveTaskInput(BaseModel):
-    """Input para mover uma task para outra list."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task a mover", min_length=1)
-    list_id: str = Field(..., description="ID da list de destino", min_length=1)
+# REMOVIDO: MoveTaskInput (tool move_task removida - limitação API ClickUp)
 
 class DuplicateTaskInput(BaseModel):
     """Input para duplicar uma task."""
@@ -2154,45 +2150,10 @@ async def delete_task(params: DeleteTaskInput) -> str:
     except Exception as e:
         return f"Erro ao deletar task: {str(e)}"
 
-@mcp.tool(
-    name="clickup_move_task",
-    annotations={
-        "title": "Mover Task",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def move_task(params: MoveTaskInput) -> str:
-    """
-    Move uma task para outra list.
-
-    Returns:
-        Confirmação da movimentação.
-    """
-    try:
-        check_write_permission("move_task")
-        # Primeiro busca a task para obter a list atual
-        task = await api_request("GET", f"/task/{params.task_id}")
-        current_list_id = task.get("list", {}).get("id")
-        
-        # Adiciona a task à nova list
-        await api_request(
-            "POST",
-            f"/list/{params.list_id}/task/{params.task_id}"
-        )
-        
-        # Remove da list original (se diferente)
-        if current_list_id and str(current_list_id) != str(params.list_id):
-            await api_request(
-                "DELETE",
-                f"/list/{current_list_id}/task/{params.task_id}"
-            )
-        
-        return f"✅ Task `{params.task_id}` movida para list `{params.list_id}` com sucesso!"
-    except Exception as e:
-        return f"Erro ao mover task: {str(e)}"
+# REMOVIDO: clickup_move_task
+# Motivo: API do ClickUp não permite remover task da lista "home" (TASK_035)
+# Feature request pendente: https://feedback.clickup.com/public-api/p/move-task-between-lists-using-the-api
+# Data: 2026-01-13 | Versão: 2.5.2
 
 @mcp.tool(
     name="clickup_duplicate_task",
@@ -2217,11 +2178,23 @@ async def duplicate_task(params: DuplicateTaskInput) -> str:
         original = await api_request("GET", f"/task/{params.task_id}")
         
         # Cria a cópia
+        # Priority: API retorna objeto {"id": "1", "priority": "urgent", ...}
+        # Mas POST espera int (1=urgent, 2=high, 3=normal, 4=low)
+        priority_obj = original.get("priority")
+        priority_value = None
+        if priority_obj and isinstance(priority_obj, dict):
+            priority_id = priority_obj.get("id")
+            if priority_id:
+                try:
+                    priority_value = int(priority_id)
+                except (ValueError, TypeError):
+                    priority_value = None
+
         json_data = {
             "name": params.name or f"Cópia de {original.get('name', 'Task')}",
             "description": original.get("description", ""),
             "status": original.get("status", {}).get("status"),
-            "priority": original.get("priority", {}).get("priority") if original.get("priority") else None,
+            "priority": priority_value,
         }
         
         # Remove campos None

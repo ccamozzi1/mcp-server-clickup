@@ -5,6 +5,25 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.0.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.5.2] - 2026-01-13
+
+### Corrigido
+
+#### duplicate_task - Priority parsing
+- Corrigido bug onde `duplicate_task` falhava com erro "Priority invalid"
+- API retorna priority como objeto `{"id": "1", "priority": "urgent"}` mas POST espera int
+- Agora extrai corretamente o ID numerico da prioridade
+
+### Removido
+
+#### move_task - Removida por limitacao da API ClickUp
+- Tool `clickup_move_task` removida do MCP
+- Motivo: API do ClickUp nao permite remover task da lista "home" (erro TASK_035)
+- Feature request pendente: https://feedback.clickup.com/public-api/p/move-task-between-lists-using-the-api
+- Total de tools: 58 → 57
+
+---
+
 ## [2.5.1] - 2026-01-13
 
 ### Corrigido (Bugfix - API Docs)
