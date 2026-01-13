@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "excalidraw": {
+      "command": "node",
+      "args": [
+        "C:/Users/Claudio Camozzi/mcp_excalidraw/dist/index.js"
+      ],
+      "env": {
+        "EXPRESS_SERVER_URL": "http://localhost:3000",
+        "ENABLE_CANVAS_SYNC": "true"
+      }
+    },
+    "ref": {
+      "command": "C:\\Program Files\\nodejs\\npx.cmd",
+      "args": [
+        "-y",
+        "ref-tools-mcp@latest"
+      ]
+    },
+    "clickup": {
+      "command": "C:\\Python314\\python.exe",
+      "args": [
+        "C:\\Users\\Claudio Camozzi\\vscode\\mcp server clickup\\src\\clickup_mcp.py"
+      ],
+      "env": {
+        "CLICKUP_API_TOKEN": "pk_18956694_BAUEELWXPYT45WTDOQQ0MSEYF0DV14GH"
+      }
+    }
+  }
+}
