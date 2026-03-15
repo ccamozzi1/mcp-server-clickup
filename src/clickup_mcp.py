@@ -48,6 +48,10 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 RATE_LIMIT_REQUESTS = 100  # requests por janela
 RATE_LIMIT_WINDOW = 60  # janela em segundos
 
+# Output limits
+MAX_OUTPUT_LENGTH = 100000  # 100KB max output size
+CACHE_KEY_HASH_LENGTH = 16  # SHA256 hash prefix length for cache keys
+
 # Modo operacional (Sprint 5)
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "false").lower() == "true"
 
@@ -105,8 +109,9 @@ def set_new_correlation_id() -> str:
     return new_id
 
 
-# Configura logger para incluir correlation_id automaticamente
-logger = logger.bind(correlation_id=get_correlation_id)
+# Configura logger para incluir correlation_id dinamicamente por request
+# Usa lazy evaluation: get_correlation_id é chamado no momento do log, não no bind
+logger = logger.patch(lambda record: record["extra"].update(correlation_id=_correlation_id.get('no-cid')))
 
 # ============================================================================
 # MÉTRICAS COM LATÊNCIA
@@ -319,9 +324,11 @@ _tasks_cache: TTLCache = TTLCache(maxsize=50, ttl=CACHE_TTL_TASKS)
 
 
 def cache_key(endpoint: str, params: Optional[Dict] = None) -> str:
-    """Gera chave de cache única para endpoint + params."""
+    """Gera chave de cache única para endpoint + params usando hash."""
+    import hashlib
     params_str = json.dumps(params, sort_keys=True) if params else ""
-    return f"{endpoint}:{params_str}"
+    raw = f"{endpoint}|{params_str}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def get_cached(endpoint: str, params: Optional[Dict] = None, cache_type: str = "structure") -> Optional[Dict]:
@@ -343,6 +350,29 @@ def set_cached(endpoint: str, data: Dict, params: Optional[Dict] = None, cache_t
     cache = _structure_cache if cache_type == "structure" else _tasks_cache
     cache[key] = data
     logger.debug(f"Cache SET: {endpoint}")
+
+
+def invalidate_cache(endpoint_pattern: str = "") -> None:
+    """Invalida cache para endpoints que contenham o padrão.
+
+    Args:
+        endpoint_pattern: Padrão para invalidar. Se vazio, limpa todo o cache.
+    """
+    if not endpoint_pattern:
+        _structure_cache.clear()
+        _tasks_cache.clear()
+        logger.debug("Cache CLEAR: all")
+        return
+    # TTLCache não suporta iteração segura durante deleção,
+    # então recriamos com itens filtrados
+    for cache in [_structure_cache, _tasks_cache]:
+        keys_to_remove = [k for k in cache if endpoint_pattern in str(k)]
+        for k in keys_to_remove:
+            try:
+                del cache[k]
+            except KeyError:
+                pass
+    logger.debug(f"Cache INVALIDATE: pattern={endpoint_pattern}")
 
 
 # ============================================================================
@@ -560,7 +590,10 @@ async def _make_request(
         if response.status_code == 204:
             return {"success": True}
 
-        return response.json()
+        result = response.json()
+        if isinstance(result, dict):
+            return sanitize_dict_values(result)
+        return result
 
     except httpx.TimeoutException:
         _metrics.record_retry()
@@ -629,6 +662,10 @@ async def api_request(
         if method == "GET" and use_cache:
             set_cached(endpoint, result, params, cache_type)
 
+        # Invalida cache em operações de escrita
+        if method != "GET":
+            invalidate_cache()
+
         return result
 
     except RetryableError as e:
@@ -665,7 +702,7 @@ def sanitize_output(text: str) -> str:
     )
 
     # Limita tamanho para evitar DoS
-    max_length = 100000  # 100KB
+    max_length = MAX_OUTPUT_LENGTH
     if len(sanitized) > max_length:
         sanitized = sanitized[:max_length] + "\n\n[... output truncado ...]"
 
@@ -698,6 +735,22 @@ def sanitize_dict_values(d: Dict[str, Any]) -> Dict[str, Any]:
         else:
             result[key] = value
     return result
+
+
+def safe_output(text: str) -> str:
+    """Sanitiza output de tool antes de retornar ao cliente MCP."""
+    return sanitize_output(text)
+
+
+def format_tool_error(operation: str, error: Exception) -> str:
+    """Formata erro de tool de forma padronizada.
+
+    Args:
+        operation: Descrição da operação que falhou
+        error: Exceção capturada
+    """
+    error_type = type(error).__name__
+    return f"**Erro ao {operation}**\n- Tipo: `{error_type}`\n- Detalhes: {sanitize_output(str(error))}"
 
 
 def format_timestamp(ts: Optional[int]) -> Optional[str]:
@@ -1019,6 +1072,9 @@ def fuzzy_search_tasks(tasks: List[Dict], query: str, threshold: float = 0.4) ->
 # MODELOS DE INPUT
 # ============================================================================
 
+# Padrão de validação para IDs do ClickUp (alfanumérico + caracteres permitidos)
+CLICKUP_ID_PATTERN = r'^[a-zA-Z0-9_\-]+$'
+
 class GetWorkspacesInput(BaseModel):
     """Input para listar workspaces."""
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -1030,7 +1086,7 @@ class GetWorkspacesInput(BaseModel):
 class GetSpacesInput(BaseModel):
     """Input para listar spaces de um workspace."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     archived: bool = Field(default=False, description="Incluir spaces arquivados")
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
@@ -1040,7 +1096,7 @@ class GetSpacesInput(BaseModel):
 class GetFoldersInput(BaseModel):
     """Input para listar folders de um space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     archived: bool = Field(default=False, description="Incluir folders arquivados")
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
@@ -1050,7 +1106,7 @@ class GetFoldersInput(BaseModel):
 class GetListsInput(BaseModel):
     """Input para listar lists de um folder."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    folder_id: str = Field(..., description="ID do folder", min_length=1)
+    folder_id: str = Field(..., description="ID do folder", min_length=1, pattern=CLICKUP_ID_PATTERN)
     archived: bool = Field(default=False, description="Incluir lists arquivadas")
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
@@ -1060,7 +1116,7 @@ class GetListsInput(BaseModel):
 class GetFolderlessListsInput(BaseModel):
     """Input para listar lists sem folder (diretamente no space)."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     archived: bool = Field(default=False, description="Incluir lists arquivadas")
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
@@ -1070,7 +1126,7 @@ class GetFolderlessListsInput(BaseModel):
 class GetTasksInput(BaseModel):
     """Input para listar tasks de uma list."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list", min_length=1)
+    list_id: str = Field(..., description="ID da list", min_length=1, pattern=CLICKUP_ID_PATTERN)
     archived: bool = Field(default=False, description="Incluir tasks arquivadas")
     include_closed: bool = Field(default=True, description="Incluir tasks fechadas")
     page: int = Field(default=0, description="Página (começa em 0)", ge=0)
@@ -1094,7 +1150,7 @@ class GetTasksInput(BaseModel):
 class GetFilteredTeamTasksInput(BaseModel):
     """Input para busca filtrada de tasks em todo o workspace."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     page: int = Field(default=0, description="Página (começa em 0)", ge=0)
     limit: int = Field(default=25, ge=1, le=100, description="Máximo de tasks a retornar (1-100)")
     order_by: Optional[OrderBy] = Field(default=None, description="Ordenar por: id, created, updated, due_date")
@@ -1120,14 +1176,14 @@ class GetFilteredTeamTasksInput(BaseModel):
 class GetTaskInput(BaseModel):
     """Input para buscar uma task específica."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     include_subtasks: bool = Field(default=True, description="Incluir subtasks")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class CreateTaskInput(BaseModel):
     """Input para criar uma nova task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list onde criar a task", min_length=1)
+    list_id: str = Field(..., description="ID da list onde criar a task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome da task", min_length=1, max_length=500)
     description: Optional[str] = Field(default=None, description="Descrição da task")
     assignees: Optional[List[int]] = Field(default=None, description="IDs dos responsáveis")
@@ -1150,7 +1206,7 @@ class CreateTaskInput(BaseModel):
 class UpdateTaskInput(BaseModel):
     """Input para atualizar uma task existente."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task a atualizar", min_length=1)
+    task_id: str = Field(..., description="ID da task a atualizar", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: Optional[str] = Field(default=None, description="Novo nome da task")
     description: Optional[str] = Field(default=None, description="Nova descrição")
     status: Optional[str] = Field(default=None, description="Novo status")
@@ -1168,15 +1224,15 @@ class UpdateTaskInput(BaseModel):
 class DeleteTaskInput(BaseModel):
     """Input para deletar uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task a deletar", min_length=1)
+    task_id: str = Field(..., description="ID da task a deletar", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 # REMOVIDO: MoveTaskInput (tool move_task removida - limitação API ClickUp)
 
 class DuplicateTaskInput(BaseModel):
     """Input para duplicar uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task a duplicar", min_length=1)
-    list_id: str = Field(..., description="ID da list de destino", min_length=1)
+    task_id: str = Field(..., description="ID da task a duplicar", min_length=1, pattern=CLICKUP_ID_PATTERN)
+    list_id: str = Field(..., description="ID da list de destino", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: Optional[str] = Field(default=None, description="Nome da cópia (opcional)")
 
 class CreateListInput(BaseModel):
@@ -1194,7 +1250,7 @@ class CreateListInput(BaseModel):
 class UpdateListInput(BaseModel):
     """Input para atualizar uma list."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list a atualizar", min_length=1)
+    list_id: str = Field(..., description="ID da list a atualizar", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: Optional[str] = Field(default=None, description="Novo nome")
     content: Optional[str] = Field(default=None, description="Nova descrição")
     due_date: Optional[int] = Field(default=None, description="Novo due date")
@@ -1205,31 +1261,31 @@ class UpdateListInput(BaseModel):
 class DeleteListInput(BaseModel):
     """Input para deletar uma list."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list a deletar", min_length=1)
+    list_id: str = Field(..., description="ID da list a deletar", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 class CreateFolderInput(BaseModel):
     """Input para criar um novo folder."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome do folder", min_length=1, max_length=200)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class UpdateFolderInput(BaseModel):
     """Input para atualizar um folder."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    folder_id: str = Field(..., description="ID do folder a atualizar", min_length=1)
+    folder_id: str = Field(..., description="ID do folder a atualizar", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Novo nome do folder", min_length=1, max_length=200)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class DeleteFolderInput(BaseModel):
     """Input para deletar um folder."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    folder_id: str = Field(..., description="ID do folder a deletar", min_length=1)
+    folder_id: str = Field(..., description="ID do folder a deletar", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 class SearchTasksInput(BaseModel):
     """Input para busca de tasks por texto."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     query: str = Field(..., description="Texto para buscar", min_length=1)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
@@ -1237,7 +1293,7 @@ class SearchTasksInput(BaseModel):
 class FuzzySearchTasksInput(BaseModel):
     """Input para busca fuzzy de tasks (Sprint 5)."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list onde buscar", min_length=1)
+    list_id: str = Field(..., description="ID da list onde buscar", min_length=1, pattern=CLICKUP_ID_PATTERN)
     query: str = Field(..., description="Texto aproximado para buscar (ex: 'relatorio' encontra 'Relatório Mensal')", min_length=1)
     threshold: float = Field(
         default=0.4,
@@ -1255,7 +1311,7 @@ class FuzzySearchTasksInput(BaseModel):
 class GetTaskCommentsInput(BaseModel):
     """Input para buscar comentários de uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -1264,7 +1320,7 @@ class GetTaskCommentsInput(BaseModel):
 class CreateTaskCommentInput(BaseModel):
     """Input para criar comentário em uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     comment_text: str = Field(..., description="Texto do comentário", min_length=1)
     assignee: Optional[int] = Field(default=None, description="ID do usuário a mencionar")
     notify_all: bool = Field(default=True, description="Notificar todos")
@@ -1273,7 +1329,7 @@ class CreateTaskCommentInput(BaseModel):
 class GetTimeEntriesInput(BaseModel):
     """Input para buscar time entries."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     start_date: Optional[int] = Field(default=None, description="Data início (timestamp ms)")
     end_date: Optional[int] = Field(default=None, description="Data fim (timestamp ms)")
     assignee: Optional[int] = Field(default=None, description="Filtrar por usuário")
@@ -1285,7 +1341,7 @@ class GetTimeEntriesInput(BaseModel):
 class GetMembersInput(BaseModel):
     """Input para buscar membros do workspace."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -1295,7 +1351,7 @@ class GetMembersInput(BaseModel):
 class CreateTimeEntryInput(BaseModel):
     """Input para criar time entry (Sprint 5)."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     task_id: Optional[str] = Field(default=None, description="ID da task (opcional)")
     description: Optional[str] = Field(default=None, description="Descrição do trabalho realizado")
     start: int = Field(..., description="Timestamp de início (ms)")
@@ -1308,7 +1364,7 @@ class CreateTimeEntryInput(BaseModel):
 class GetBillableReportInput(BaseModel):
     """Input para relatório de horas faturáveis (Sprint 5)."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     start_date: int = Field(..., description="Data início (timestamp ms)")
     end_date: int = Field(..., description="Data fim (timestamp ms)")
     assignee: Optional[int] = Field(default=None, description="Filtrar por usuário")
@@ -2600,7 +2656,7 @@ async def get_billable_report(params: GetBillableReportInput) -> str:
 class GetCustomFieldsInput(BaseModel):
     """Input para listar custom fields de uma list."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list", min_length=1)
+    list_id: str = Field(..., description="ID da list", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -2668,7 +2724,7 @@ async def get_custom_fields(params: GetCustomFieldsInput) -> str:
 class GetSpaceDetailsInput(BaseModel):
     """Input para buscar detalhes de um space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.DETAILED,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -2746,7 +2802,7 @@ async def get_space_details(params: GetSpaceDetailsInput) -> str:
 class GetListDetailsInput(BaseModel):
     """Input para buscar detalhes de uma list."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list", min_length=1)
+    list_id: str = Field(..., description="ID da list", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.DETAILED,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -2826,7 +2882,7 @@ async def get_list_details(params: GetListDetailsInput) -> str:
 class GetChecklistsInput(BaseModel):
     """Input para buscar checklists de uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.DETAILED,
         description="Modo de output: compact (resumo), detailed (completo), json (raw)"
@@ -2901,7 +2957,7 @@ async def get_checklists(params: GetChecklistsInput) -> str:
 class GetAttachmentsInput(BaseModel):
     """Input para buscar anexos de uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -2972,7 +3028,7 @@ async def get_attachments(params: GetAttachmentsInput) -> str:
 class AnalyzeSpaceStructureInput(BaseModel):
     """Input para análise morfológica do space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     include_tasks_count: bool = Field(default=True, description="Incluir contagem de tasks por list")
     output_mode: OutputMode = Field(
         default=OutputMode.DETAILED,
@@ -3111,7 +3167,7 @@ async def analyze_space_structure(params: AnalyzeSpaceStructureInput) -> str:
 class GetDocsInput(BaseModel):
     """Input para listar docs de um workspace."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    workspace_id: str = Field(..., description="ID do workspace", min_length=1)
+    workspace_id: str = Field(..., description="ID do workspace", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(
         default=OutputMode.COMPACT,
         description="Modo de output: compact (1 linha), detailed (completo), json (raw)"
@@ -3195,7 +3251,7 @@ async def get_docs(params: GetDocsInput) -> str:
 class CreateDocInput(BaseModel):
     """Input para criar um documento."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    workspace_id: str = Field(..., description="ID do workspace", min_length=1)
+    workspace_id: str = Field(..., description="ID do workspace", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome do documento", min_length=1)
     content: Optional[str] = Field(default=None, description="Conteúdo inicial do documento (markdown)")
     parent_id: Optional[str] = Field(default=None, description="ID do parent (space, folder, list ou task)")
@@ -3339,8 +3395,8 @@ async def get_metrics(params: GetMetricsInput) -> str:
 class SetCustomFieldValueInput(BaseModel):
     """Input para definir valor de um custom field em uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
-    field_id: str = Field(..., description="ID do custom field (use clickup_get_custom_fields para obter)", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
+    field_id: str = Field(..., description="ID do custom field (use clickup_get_custom_fields para obter)", min_length=1, pattern=CLICKUP_ID_PATTERN)
     value: Any = Field(
         ...,
         description="Valor do campo. Formato varia por tipo: text='string', number=123, dropdown='option_id', checkbox=true/false, date=timestamp_ms (int), labels=['id1','id2'], users={'add':['user_id'],'rem':['user_id']}, tasks={'add':['task_id'],'rem':['task_id']}, location={'location':{'lat':0,'lng':0},'formatted_address':'addr'}, currency=1000, progress={'current':50}, rating=4, email='a@b.com', phone='+5511999999999'"
@@ -3402,8 +3458,8 @@ async def set_custom_field_value(params: SetCustomFieldValueInput) -> str:
 class RemoveCustomFieldValueInput(BaseModel):
     """Input para remover valor de um custom field."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
-    field_id: str = Field(..., description="ID do custom field", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
+    field_id: str = Field(..., description="ID do custom field", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 
 @mcp.tool(
@@ -3440,7 +3496,7 @@ async def remove_custom_field_value(params: RemoveCustomFieldValueInput) -> str:
 class GetSpaceTagsInput(BaseModel):
     """Input para listar tags de um space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     output_mode: OutputMode = Field(default=OutputMode.COMPACT, description="Modo de output")
 
 
@@ -3493,7 +3549,7 @@ async def get_space_tags(params: GetSpaceTagsInput) -> str:
 class CreateSpaceTagInput(BaseModel):
     """Input para criar tag em um space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome da tag", min_length=1, max_length=100)
     tag_fg: Optional[str] = Field(default=None, description="Cor do texto (hex, ex: #FFFFFF)")
     tag_bg: Optional[str] = Field(default=None, description="Cor do fundo (hex, ex: #000000)")
@@ -3534,7 +3590,7 @@ async def create_space_tag(params: CreateSpaceTagInput) -> str:
 class UpdateSpaceTagInput(BaseModel):
     """Input para atualizar tag de um space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     tag_name: str = Field(..., description="Nome atual da tag", min_length=1)
     new_name: Optional[str] = Field(default=None, description="Novo nome da tag")
     tag_fg: Optional[str] = Field(default=None, description="Nova cor do texto (hex)")
@@ -3577,7 +3633,7 @@ async def update_space_tag(params: UpdateSpaceTagInput) -> str:
 class DeleteSpaceTagInput(BaseModel):
     """Input para deletar tag de um space."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    space_id: str = Field(..., description="ID do space", min_length=1)
+    space_id: str = Field(..., description="ID do space", min_length=1, pattern=CLICKUP_ID_PATTERN)
     tag_name: str = Field(..., description="Nome da tag a deletar", min_length=1)
 
 
@@ -3610,7 +3666,7 @@ async def delete_space_tag(params: DeleteSpaceTagInput) -> str:
 class AddTagToTaskInput(BaseModel):
     """Input para adicionar tag a uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     tag_name: str = Field(..., description="Nome da tag a adicionar", min_length=1)
 
 
@@ -3643,7 +3699,7 @@ async def add_tag_to_task(params: AddTagToTaskInput) -> str:
 class RemoveTagFromTaskInput(BaseModel):
     """Input para remover tag de uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     tag_name: str = Field(..., description="Nome da tag a remover", min_length=1)
 
 
@@ -3678,7 +3734,7 @@ async def remove_tag_from_task(params: RemoveTagFromTaskInput) -> str:
 class AddDependencyInput(BaseModel):
     """Input para adicionar dependência entre tasks."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task que terá a dependência", min_length=1)
+    task_id: str = Field(..., description="ID da task que terá a dependência", min_length=1, pattern=CLICKUP_ID_PATTERN)
     depends_on: str = Field(..., description="ID da task da qual depende", min_length=1)
 
 
@@ -3712,7 +3768,7 @@ async def add_dependency(params: AddDependencyInput) -> str:
 class DeleteDependencyInput(BaseModel):
     """Input para remover dependência entre tasks."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task que tem a dependência", min_length=1)
+    task_id: str = Field(..., description="ID da task que tem a dependência", min_length=1, pattern=CLICKUP_ID_PATTERN)
     depends_on: str = Field(..., description="ID da task da qual dependia", min_length=1)
 
 
@@ -3743,7 +3799,7 @@ async def delete_dependency(params: DeleteDependencyInput) -> str:
 class AddTaskLinkInput(BaseModel):
     """Input para criar link entre tasks."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task origem", min_length=1)
+    task_id: str = Field(..., description="ID da task origem", min_length=1, pattern=CLICKUP_ID_PATTERN)
     links_to: str = Field(..., description="ID da task destino", min_length=1)
 
 
@@ -3777,7 +3833,7 @@ async def add_task_link(params: AddTaskLinkInput) -> str:
 class DeleteTaskLinkInput(BaseModel):
     """Input para remover link entre tasks."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task origem", min_length=1)
+    task_id: str = Field(..., description="ID da task origem", min_length=1, pattern=CLICKUP_ID_PATTERN)
     links_to: str = Field(..., description="ID da task destino", min_length=1)
 
 
@@ -3812,7 +3868,7 @@ async def delete_task_link(params: DeleteTaskLinkInput) -> str:
 class CreateChecklistInput(BaseModel):
     """Input para criar checklist em uma task."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    task_id: str = Field(..., description="ID da task", min_length=1)
+    task_id: str = Field(..., description="ID da task", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome do checklist", min_length=1, max_length=200)
 
 
@@ -3847,7 +3903,7 @@ async def create_checklist(params: CreateChecklistInput) -> str:
 class UpdateChecklistInput(BaseModel):
     """Input para atualizar checklist."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    checklist_id: str = Field(..., description="ID do checklist", min_length=1)
+    checklist_id: str = Field(..., description="ID do checklist", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: Optional[str] = Field(default=None, description="Novo nome do checklist")
     position: Optional[int] = Field(default=None, description="Nova posição (ordem)")
 
@@ -3886,7 +3942,7 @@ async def update_checklist(params: UpdateChecklistInput) -> str:
 class DeleteChecklistInput(BaseModel):
     """Input para deletar checklist."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    checklist_id: str = Field(..., description="ID do checklist a deletar", min_length=1)
+    checklist_id: str = Field(..., description="ID do checklist a deletar", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 
 @mcp.tool(
@@ -3916,7 +3972,7 @@ async def delete_checklist(params: DeleteChecklistInput) -> str:
 class CreateChecklistItemInput(BaseModel):
     """Input para criar item em checklist."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    checklist_id: str = Field(..., description="ID do checklist", min_length=1)
+    checklist_id: str = Field(..., description="ID do checklist", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome/texto do item", min_length=1, max_length=500)
     assignee: Optional[int] = Field(default=None, description="ID do responsável pelo item")
 
@@ -3956,8 +4012,8 @@ async def create_checklist_item(params: CreateChecklistItemInput) -> str:
 class UpdateChecklistItemInput(BaseModel):
     """Input para atualizar item do checklist."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    checklist_id: str = Field(..., description="ID do checklist", min_length=1)
-    checklist_item_id: str = Field(..., description="ID do item", min_length=1)
+    checklist_id: str = Field(..., description="ID do checklist", min_length=1, pattern=CLICKUP_ID_PATTERN)
+    checklist_item_id: str = Field(..., description="ID do item", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: Optional[str] = Field(default=None, description="Novo nome/texto do item")
     resolved: Optional[bool] = Field(default=None, description="Marcar como concluído (true) ou pendente (false)")
     assignee: Optional[int] = Field(default=None, description="ID do responsável")
@@ -4004,8 +4060,8 @@ async def update_checklist_item(params: UpdateChecklistItemInput) -> str:
 class DeleteChecklistItemInput(BaseModel):
     """Input para deletar item do checklist."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    checklist_id: str = Field(..., description="ID do checklist", min_length=1)
-    checklist_item_id: str = Field(..., description="ID do item a deletar", min_length=1)
+    checklist_id: str = Field(..., description="ID do checklist", min_length=1, pattern=CLICKUP_ID_PATTERN)
+    checklist_item_id: str = Field(..., description="ID do item a deletar", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 
 @mcp.tool(
@@ -4039,7 +4095,7 @@ async def delete_checklist_item(params: DeleteChecklistItemInput) -> str:
 class StartTimeEntryInput(BaseModel):
     """Input para iniciar timer."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     task_id: Optional[str] = Field(default=None, description="ID da task (opcional)")
     description: Optional[str] = Field(default=None, description="Descrição do que está fazendo")
     billable: bool = Field(default=False, description="Se é hora faturável")
@@ -4082,7 +4138,7 @@ async def start_timer(params: StartTimeEntryInput) -> str:
 class StopTimeEntryInput(BaseModel):
     """Input para parar timer."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 
 @mcp.tool(
@@ -4116,7 +4172,7 @@ async def stop_timer(params: StopTimeEntryInput) -> str:
 class GetRunningTimeEntryInput(BaseModel):
     """Input para obter timer em execução."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
 
 
 @mcp.tool(
@@ -4157,7 +4213,7 @@ async def get_running_timer(params: GetRunningTimeEntryInput) -> str:
 class GetTaskTemplatesInput(BaseModel):
     """Input para listar templates de tasks."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    team_id: str = Field(..., description="ID do workspace/team", min_length=1)
+    team_id: str = Field(..., description="ID do workspace/team", min_length=1, pattern=CLICKUP_ID_PATTERN)
     page: int = Field(default=0, description="Página de resultados (começa em 0)")
     output_mode: OutputMode = Field(default=OutputMode.COMPACT, description="Modo de output")
 
@@ -4210,8 +4266,8 @@ async def get_task_templates(params: GetTaskTemplatesInput) -> str:
 class CreateTaskFromTemplateInput(BaseModel):
     """Input para criar task a partir de template."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    list_id: str = Field(..., description="ID da list onde criar a task", min_length=1)
-    template_id: str = Field(..., description="ID do template", min_length=1)
+    list_id: str = Field(..., description="ID da list onde criar a task", min_length=1, pattern=CLICKUP_ID_PATTERN)
+    template_id: str = Field(..., description="ID do template", min_length=1, pattern=CLICKUP_ID_PATTERN)
     name: str = Field(..., description="Nome da nova task", min_length=1, max_length=500)
 
 
