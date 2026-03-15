@@ -20,10 +20,10 @@
     "clickup": {
       "command": "C:\\Python314\\python.exe",
       "args": [
-        "C:\\Users\\Claudio Camozzi\\vscode\\mcp server clickup\\src\\clickup_mcp.py"
+        "C:\\AI.Army\\mcp server clickup\\src\\clickup_mcp.py"
       ],
       "env": {
-        "CLICKUP_API_TOKEN": "pk_18956694_BAUEELWXPYT45WTDOQQ0MSEYF0DV14GH"
+        "CLICKUP_API_TOKEN": "${CLICKUP_API_TOKEN}"
       }
     }
   }
